@@ -1,0 +1,14 @@
+[project]
+name = "lastmem"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "mem0ai[nlp]",
+    "boto3",
+    "python-dotenv",
+    "ollama",
+    "click>=8.4.1",
+    "langfuse>=4.7.1",
+]
