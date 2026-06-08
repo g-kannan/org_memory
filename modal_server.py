@@ -452,6 +452,21 @@ def _make_app():
                 "Valid scopes are: 'org', 'team', 'project', 'user'."
             )
 
+    def normalize_metadata(metadata: dict[str, Any] | str | None) -> dict[str, Any]:
+        """Accept object metadata or JSON-encoded object metadata from MCP clients."""
+        if metadata is None:
+            return {}
+        if isinstance(metadata, dict):
+            return metadata
+        if isinstance(metadata, str):
+            try:
+                parsed = json.loads(metadata)
+            except json.JSONDecodeError as exc:
+                raise ValueError("metadata must be a JSON object or JSON-encoded object string") from exc
+            if isinstance(parsed, dict):
+                return parsed
+        raise ValueError("metadata must be an object")
+
     # ------------------------------------------------------------------
     # S3-safe Memory subclass (separate entity store collection)
     # ------------------------------------------------------------------
@@ -576,7 +591,7 @@ def _make_app():
         team_id: str | None = None,
         project_id: str | None = None,
         user_id: str | None = None,
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | str | None = None,
     ) -> dict:
         """Store a single memory string at a specified scope.
 
@@ -613,11 +628,16 @@ def _make_app():
         except ValueError as exc:
             return {"error": str(exc)}
 
+        try:
+            memory_metadata = normalize_metadata(metadata)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
         # Store to backend
         result = _memory.add(
             [{"role": "user", "content": memory}],
             user_id=scope_key,
-            metadata={**(metadata or {}), "scope": scope, "scope_key": scope_key},
+            metadata={**memory_metadata, "scope": scope, "scope_key": scope_key},
         )
 
         # Extract memory_id from the add result
