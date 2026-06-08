@@ -300,12 +300,20 @@ class S3VectorsSimilarity(S3Vectors):
 VectorStoreFactory.provider_to_class["s3_vectors"] = f"{__name__}.S3VectorsSimilarity"
 DEFAULT_AWS_BEDROCK_FACTORY = LlmFactory.provider_to_class["aws_bedrock"]
 
-
-embedding_dims = get_embedding_dims(EMBEDDING_MODEL)
-collection_name = s3_safe_index_name(os.getenv("COLLECTION", "mem0"))
-entity_collection_name = s3_safe_index_name(f"{collection_name}-entities")
-validate_s3_vector_index_dims(embedding_dims, collection_name)
-validate_s3_vector_index_dims(embedding_dims, entity_collection_name)
+# These are only needed for the local Ollama-backed workflow.
+# When imported by modal_server.py (or any other caller that sets
+# SKIP_OLLAMA_INIT=1), we skip the Ollama calls entirely.
+if not os.getenv("SKIP_OLLAMA_INIT"):
+    embedding_dims = get_embedding_dims(EMBEDDING_MODEL)
+    collection_name = s3_safe_index_name(os.getenv("COLLECTION", "mem0"))
+    entity_collection_name = s3_safe_index_name(f"{collection_name}-entities")
+    validate_s3_vector_index_dims(embedding_dims, collection_name)
+    validate_s3_vector_index_dims(embedding_dims, entity_collection_name)
+else:
+    # Placeholders — callers must supply their own config via build_memory_config()
+    embedding_dims = int(os.getenv("EMBEDDING_DIMS", "1024"))
+    collection_name = s3_safe_index_name(os.getenv("COLLECTION", "mem0"))
+    entity_collection_name = s3_safe_index_name(f"{collection_name}-entities")
 
 
 class S3SafeMemory(Mem0Memory):
@@ -438,9 +446,6 @@ def build_memory_config(llm_provider: str | None = None, llm_model: str | None =
             },
         },
     }
-
-
-config = build_memory_config()
 
 
 def main():
