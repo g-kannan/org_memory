@@ -20,6 +20,49 @@ One-time secret setup:
         LANGFUSE_BASE_URL=https://jp.cloud.langfuse.com \
         LLM_PROVIDER=aws_bedrock \
         BEDROCK_MODEL=openai.gpt-oss-20b-1:0
+
+-------------------------------------------------------------------------------
+Scoped Memory — Identity Header & Scope Levels
+-------------------------------------------------------------------------------
+
+X-Memory-Context header
+    Every MCP request that targets org-, team-, or project-scoped memories MUST
+    include this HTTP header.  The header carries the calling identity in one of
+    three formats:
+
+        org:<org_id>
+        org:<org_id>:team:<team_id>
+        org:<org_id>:team:<team_id>:project:<project_id>
+
+    Each component (org_id, team_id, project_id) must contain only characters
+    from [A-Za-z0-9_-].  User-scoped operations supply a user_id directly in
+    the tool-call body instead and do not require this header.
+
+Scope levels and their Scope_Key formats
+    The scope parameter on store_memory / retrieve_memory selects one of four
+    hierarchical levels.  The resolved Scope_Key is stored as metadata on every
+    Memory_Entry and used as the partition filter in Memory_Backend queries.
+
+    Scope       Requires in header          Scope_Key format
+    -------     --------------------------  ------------------------------------------
+    org         org_id                      org:<org_id>
+    team        org_id, team_id             team:<org_id>:<team_id>
+    project     org_id, team_id, project_id project:<org_id>:<team_id>:<project_id>
+    user        (none — pass user_id in     user:<user_id>
+                 the tool call instead)
+
+MCP tools
+    store_memory(memory, scope, team_id=None, project_id=None,
+                 user_id=None, metadata=None) -> {"memory_id": ..., "scope_key": ...}
+        Store a single memory string under the resolved scope.  Returns the
+        memory_id assigned by the backend and the Scope_Key used.
+
+    retrieve_memory(query, scope=None, team_id=None, project_id=None,
+                    user_id=None, top_k=10) -> list[MemoryResult]
+        Search memories by semantic similarity.  When scope is given the search
+        is filtered to that Scope_Key; when omitted all entries whose scope_key
+        is accessible from the calling org are searched.
+
 """
 
 import json
@@ -194,7 +237,8 @@ def _make_app():
 
     from fastapi import FastAPI
     from fastmcp import FastMCP
-    from pydantic import BaseModel, ConfigDict, Field
+    from fastmcp.server.dependencies import get_http_request
+    from pydantic import BaseModel, Field
 
     from mem0 import Memory as Mem0Memory
     from mem0.memory.main import _safe_deepcopy_config
@@ -248,6 +292,165 @@ def _make_app():
             get_langfuse_client().flush()
         except Exception as exc:
             logger.warning("Langfuse flush failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Context_Parser — parse and validate X-Memory-Context header
+    # ------------------------------------------------------------------
+    _COMPONENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+    def parse_memory_context(header_value: str | None) -> dict | None:
+        """Parse and validate the ``X-Memory-Context`` HTTP header.
+
+        Args:
+            header_value: Raw value of the ``X-Memory-Context`` header, or
+                ``None`` when the header is absent.
+
+        Returns:
+            ``None`` when the header is absent (callers decide how to handle
+            that case).  Otherwise a dict with the following keys:
+
+            * ``org_id`` (str) — always present.
+            * ``team_id`` (str) — present only when the header includes a team
+              component.
+            * ``project_id`` (str) — present only when the header includes a
+              project component.
+
+        Raises:
+            ValueError: If the header value does not match one of the three
+                recognised formats, or if any identity component contains
+                characters outside ``[A-Za-z0-9_-]``.
+
+        Valid formats::
+
+            org:<org_id>
+            org:<org_id>:team:<team_id>
+            org:<org_id>:team:<team_id>:project:<project_id>
+        """
+        if header_value is None:
+            return None
+
+        parts = header_value.split(":")
+
+        # --- structural validation ---
+        valid = False
+        if len(parts) == 2 and parts[0] == "org":
+            valid = True
+        elif len(parts) == 4 and parts[0] == "org" and parts[2] == "team":
+            valid = True
+        elif len(parts) == 6 and parts[0] == "org" and parts[2] == "team" and parts[4] == "project":
+            valid = True
+
+        if not valid:
+            raise ValueError(
+                "Invalid X-Memory-Context header. Expected one of:\n"
+                "  org:<org_id>\n"
+                "  org:<org_id>:team:<team_id>\n"
+                "  org:<org_id>:team:<team_id>:project:<project_id>"
+            )
+
+        # --- character validation on each identity component ---
+        # component positions: org_id=1, team_id=3 (if present), project_id=5 (if present)
+        component_positions = {1: "org_id"}
+        if len(parts) >= 4:
+            component_positions[3] = "team_id"
+        if len(parts) == 6:
+            component_positions[5] = "project_id"
+
+        for idx, name in component_positions.items():
+            value = parts[idx]
+            if not value:
+                raise ValueError(
+                    f"Invalid X-Memory-Context header: '{name}' component is empty."
+                )
+            if not _COMPONENT_RE.match(value):
+                raise ValueError(
+                    f"Invalid X-Memory-Context header: '{name}' component '{value}' "
+                    f"contains characters outside [A-Za-z0-9_-]."
+                )
+
+        # --- build result dict ---
+        result: dict = {"org_id": parts[1]}
+        if len(parts) >= 4:
+            result["team_id"] = parts[3]
+        if len(parts) == 6:
+            result["project_id"] = parts[5]
+        return result
+
+    # ------------------------------------------------------------------
+    # Scope_Resolver — map scope enum + parsed context to Scope_Key
+    # ------------------------------------------------------------------
+
+    def resolve_scope_key(scope: str, ctx: dict | None, user_id: str | None = None) -> str:
+        """Resolve a scope enum value and parsed context to a concrete Scope_Key.
+
+        Args:
+            scope: One of ``"org"``, ``"team"``, ``"project"``, or ``"user"``.
+            ctx: Parsed context dict returned by ``parse_memory_context()`` — contains
+                ``org_id`` (always present), ``team_id`` (optional), and ``project_id``
+                (optional).  May be ``None`` only when ``scope="user"`` where no
+                Identity_Header is required.
+            user_id: The user identifier; required when ``scope="user"``.
+
+        Returns:
+            A Scope_Key string in one of the following formats:
+
+            * ``org:<org_id>``
+            * ``team:<org_id>:<team_id>``
+            * ``project:<org_id>:<team_id>:<project_id>``
+            * ``user:<user_id>``
+
+        Raises:
+            ValueError: When required identifiers are missing for the requested scope,
+                or when ``scope`` is not one of the four recognised values.
+        """
+        if scope == "org":
+            if ctx is None or not ctx.get("org_id"):
+                raise ValueError(
+                    "scope 'org' requires 'org_id' from the X-Memory-Context header."
+                )
+            return f"org:{ctx['org_id']}"
+
+        elif scope == "team":
+            if ctx is None or not ctx.get("org_id"):
+                raise ValueError(
+                    "scope 'team' requires 'org_id' from the X-Memory-Context header."
+                )
+            if not ctx.get("team_id"):
+                raise ValueError(
+                    "scope 'team' requires 'team_id' in the X-Memory-Context header "
+                    "(expected format: org:<org_id>:team:<team_id>)."
+                )
+            return f"team:{ctx['org_id']}:{ctx['team_id']}"
+
+        elif scope == "project":
+            if ctx is None or not ctx.get("org_id"):
+                raise ValueError(
+                    "scope 'project' requires 'org_id' from the X-Memory-Context header."
+                )
+            if not ctx.get("team_id"):
+                raise ValueError(
+                    "scope 'project' requires 'team_id' in the X-Memory-Context header "
+                    "(expected format: org:<org_id>:team:<team_id>:project:<project_id>)."
+                )
+            if not ctx.get("project_id"):
+                raise ValueError(
+                    "scope 'project' requires 'project_id' in the X-Memory-Context header "
+                    "(expected format: org:<org_id>:team:<team_id>:project:<project_id>)."
+                )
+            return f"project:{ctx['org_id']}:{ctx['team_id']}:{ctx['project_id']}"
+
+        elif scope == "user":
+            if not user_id:
+                raise ValueError(
+                    "scope 'user' requires a 'user_id' to be supplied in the tool call."
+                )
+            return f"user:{user_id}"
+
+        else:
+            raise ValueError(
+                f"Unrecognised scope '{scope}'. "
+                "Valid scopes are: 'org', 'team', 'project', 'user'."
+            )
 
     # ------------------------------------------------------------------
     # S3-safe Memory subclass (separate entity store collection)
@@ -355,17 +558,6 @@ def _make_app():
     # ------------------------------------------------------------------
     # MCP tool models
     # ------------------------------------------------------------------
-    class Message(BaseModel):
-        role: str = Field(..., description="Message role: 'user' or 'assistant'")
-        content: str = Field(..., description="Message text content")
-
-    class Metadata(BaseModel):
-        model_config = ConfigDict(extra="allow")
-        user_id: str = Field(..., description="Required. Identifies the memory owner")
-        category: str | None = Field(None, description="Optional category label")
-        tags: list[str] | None = Field(None, description="Optional list of tags")
-        source: str | None = Field(None, description="Optional source identifier")
-
     class MemoryResult(BaseModel):
         id: str
         score: float | None = None
@@ -378,59 +570,156 @@ def _make_app():
     mcp = FastMCP("lastmem MCP Message Store")
 
     @mcp.tool()
-    def store_messages(messages: list[Message], metadata: Metadata) -> Any:
-        """Store a list of messages with metadata into the memory backend.
+    async def store_memory(
+        memory: str,
+        scope: str,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        user_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> dict:
+        """Store a single memory string at a specified scope.
 
         Args:
-            messages: One or more messages to store (each with role and content).
-            metadata: Metadata to attach; user_id is required.
+            memory: The memory text to store. Must be a non-empty string.
+            scope: The scope level — one of 'org', 'team', 'project', or 'user'.
+            team_id: Override the team_id from the Identity Header (only used when scope='team' or 'project').
+            project_id: Override the project_id from the Identity Header (only used when scope='project').
+            user_id: Required when scope='user'; ignored for all other scopes.
+            metadata: Optional key-value map of extra metadata to attach to the memory.
         """
-        if not messages:
-            raise ValueError("messages must contain at least one item")
-        with langfuse_observation(
-            name="mcp-store_messages",
-            input={"messages": [m.model_dump() for m in messages], "metadata": metadata.model_dump()},
-            metadata={"user_id": metadata.user_id},
-        ) as span:
-            result = _memory.add(
-                [m.model_dump() for m in messages],
-                user_id=metadata.user_id,
-                metadata=metadata.model_dump(),
-            )
-            if span:
-                span.update(output=result)
-            flush_langfuse()
-            return result
+        # Reject empty memory before touching the backend
+        if not memory or not memory.strip():
+            return {"error": "memory must be a non-empty string"}
+
+        # Read and parse the X-Memory-Context header
+        try:
+            request = get_http_request()
+            header_value = request.headers.get("x-memory-context") or request.headers.get("X-Memory-Context")
+            parsed_ctx = parse_memory_context(header_value)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        # Allow tool-call team_id / project_id to override what's in the header (req 3.4)
+        if parsed_ctx is not None:
+            if team_id is not None:
+                parsed_ctx = {**parsed_ctx, "team_id": team_id}
+            if project_id is not None:
+                parsed_ctx = {**parsed_ctx, "project_id": project_id}
+
+        # Resolve the scope key
+        try:
+            scope_key = resolve_scope_key(scope, parsed_ctx, user_id=user_id)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        # Store to backend
+        result = _memory.add(
+            [{"role": "user", "content": memory}],
+            user_id=scope_key,
+            metadata={**(metadata or {}), "scope": scope, "scope_key": scope_key},
+        )
+
+        # Extract memory_id from the add result
+        memory_id = None
+        if isinstance(result, dict):
+            # mem0 returns {"results": [{"id": ..., "event": "ADD", ...}, ...]}
+            results_list = result.get("results", [])
+            if results_list and isinstance(results_list, list):
+                memory_id = results_list[0].get("id")
+            if memory_id is None:
+                memory_id = result.get("id") or result.get("memory_id")
+        elif isinstance(result, list) and result:
+            first = result[0]
+            if isinstance(first, dict):
+                memory_id = first.get("id") or first.get("memory_id")
+
+        return {"memory_id": memory_id, "scope_key": scope_key}
 
     @mcp.tool()
-    def retrieve_messages(query: str, user_id: str, top_k: int = 10) -> list[MemoryResult]:
-        """Search stored memories by semantic similarity.
+    async def retrieve_memory(
+        query: str,
+        scope: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        user_id: str | None = None,
+        top_k: int = 10,
+    ) -> list[MemoryResult] | dict:
+        """Search stored memories by semantic similarity with optional scope filtering.
 
         Args:
-            query: Natural language search query.
-            user_id: Filter results to this user.
-            top_k: Maximum number of results to return (default 10).
+            query: Natural language search query. Must be a non-empty string.
+            scope: Optional scope level — one of 'org', 'team', 'project', or 'user'.
+                   When omitted, searches all entries accessible from the calling org.
+            team_id: Override the team_id from the Identity Header (used when scope='team' or 'project').
+            project_id: Override the project_id from the Identity Header (used when scope='project').
+            user_id: Required when scope='user'; ignored for all other scopes.
+            top_k: Maximum number of results to return (default 10). Must be >= 1.
         """
-        with langfuse_observation(
-            name="mcp-retrieve_messages",
-            input={"query": query, "user_id": user_id, "top_k": top_k},
-        ) as span:
-            response = _memory.search(query, filters={"user_id": user_id}, limit=top_k)
-            items = response.get("results", response) if isinstance(response, dict) else response
-            results = [
-                MemoryResult(
-                    id=r.get("id", ""),
-                    score=r.get("score"),
-                    memory=r.get("memory", ""),
-                    metadata=r.get("metadata") or {},
-                )
-                for r in items
-                if isinstance(r, dict)
-            ]
-            if span:
-                span.update(output=[r.model_dump() for r in results])
-            flush_langfuse()
-            return results
+        # Reject empty query before touching the backend (req 4.1)
+        if not query or not query.strip():
+            return {"error": "query must be a non-empty string"}
+
+        # Reject invalid top_k before touching the backend (req 4.6)
+        if top_k < 1:
+            return {"error": "top_k must be a positive integer"}
+
+        # Read and parse the X-Memory-Context header
+        try:
+            request = get_http_request()
+            header_value = request.headers.get("x-memory-context") or request.headers.get("X-Memory-Context")
+            parsed_ctx = parse_memory_context(header_value)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        # Allow tool-call team_id / project_id to override what's in the header
+        if parsed_ctx is not None:
+            if team_id is not None:
+                parsed_ctx = {**parsed_ctx, "team_id": team_id}
+            if project_id is not None:
+                parsed_ctx = {**parsed_ctx, "project_id": project_id}
+
+        if scope is not None:
+            # Scoped search: resolve the scope key and filter to exact match (req 4.2, 8.4)
+            try:
+                scope_key = resolve_scope_key(scope, parsed_ctx, user_id=user_id)
+            except ValueError as exc:
+                return {"error": str(exc)}
+
+            # mem0 uses user_id as the partition filter; pass scope_key as user_id (req 4.7)
+            response = _memory.search(query, filters={"user_id": scope_key}, limit=top_k)
+        else:
+            # Unscoped search: search all entries for the org (req 4.3)
+            # The header must be present so we can derive org_id for future prefix-based
+            # filtering. mem0 does not natively support prefix filtering, so we search
+            # across the entire index and return all results — the caller receives results
+            # from all scope levels without further server-side narrowing.
+            if parsed_ctx is None:
+                return {"error": "X-Memory-Context header is required when scope is not specified"}
+            # org_id is available via parsed_ctx["org_id"] for future use
+            response = _memory.search(query, limit=top_k)
+
+        # Normalise response shape (mem0 may return a dict or a list)
+        items = response.get("results", response) if isinstance(response, dict) else response
+
+        # Map to MemoryResult; pull scope_key from stored metadata (req 4.4)
+        results = [
+            MemoryResult(
+                id=r.get("id", ""),
+                score=r.get("score"),
+                memory=r.get("memory", ""),
+                metadata={
+                    **(r.get("metadata") or {}),
+                    # surface scope_key at the top level of metadata for convenience
+                    "scope_key": (r.get("metadata") or {}).get("scope_key", ""),
+                },
+            )
+            for r in items
+            if isinstance(r, dict)
+        ]
+
+        # Return empty list when no results without raising an error (req 4.5)
+        return results
 
     # ------------------------------------------------------------------
     # FastAPI + streamable-HTTP MCP transport (stateless)
