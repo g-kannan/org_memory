@@ -22,6 +22,10 @@ One-time secret setup:
         BEDROCK_MODEL=openai.gpt-oss-20b-1:0
 """
 
+import json
+import re
+import logging
+
 import modal
 
 secrets = [modal.Secret.from_name("org-memory-secrets")]
@@ -47,160 +51,144 @@ app = modal.App("org-memory-mcp", image=image, secrets=secrets)
 # ---------------------------------------------------------------------------
 # Custom classes defined at module level so VectorStoreFactory / LlmFactory
 # can locate them via their dotted module path (they call cls.rsplit(".", 1)).
+# These MUST be at module level — defining them inside a function means the
+# factory cannot import them by their dotted path at instantiation time.
 # ---------------------------------------------------------------------------
 
-def _register_providers():
-    """
-    Import and register custom mem0 provider classes.
-    Called once inside the container at startup.
-    Returns (S3VectorsSimilarity, BedrockOpenAILLM, AWSBedrockConfig).
-    """
-    import json
-    import re
-    import logging
+from mem0.llms.aws_bedrock import AWSBedrockLLM
+from mem0.configs.llms.aws_bedrock import AWSBedrockConfig
+from mem0.utils.factory import LlmFactory, VectorStoreFactory
+from mem0.vector_stores.s3_vectors import S3Vectors, OutputData
 
-    from mem0.llms.aws_bedrock import AWSBedrockLLM
-    from mem0.configs.llms.aws_bedrock import AWSBedrockConfig
-    from mem0.utils.factory import LlmFactory, VectorStoreFactory
-    from mem0.vector_stores.s3_vectors import S3Vectors, OutputData
+logger = logging.getLogger(__name__)
 
-    logger = logging.getLogger(__name__)
 
-    # ------------------------------------------------------------------
-    # S3 Vectors store — converts distance to similarity score
-    # ------------------------------------------------------------------
-    class S3VectorsSimilarity(S3Vectors):
-        def _distance_to_similarity(self, distance):
-            if distance is None:
-                return None
-            if self.distance_metric == "cosine":
-                return max(0.0, min(1.0, 1.0 - distance))
-            if self.distance_metric == "euclidean":
-                return 1.0 / (1.0 + distance)
-            return distance
+class S3VectorsSimilarity(S3Vectors):
+    """S3 Vectors store that converts distance to a similarity score."""
 
-        def _parse_output(self, vectors):
-            results = []
-            for v in vectors:
-                payload = v.get("metadata", {})
-                if isinstance(payload, str):
-                    try:
-                        payload = json.loads(payload)
-                    except json.JSONDecodeError:
-                        payload = {}
-                results.append(
-                    OutputData(
-                        id=v.get("key"),
-                        score=self._distance_to_similarity(v.get("distance")),
-                        payload=payload,
-                    )
-                )
-            return results
+    def _distance_to_similarity(self, distance):
+        if distance is None:
+            return None
+        if self.distance_metric == "cosine":
+            return max(0.0, min(1.0, 1.0 - distance))
+        if self.distance_metric == "euclidean":
+            return 1.0 / (1.0 + distance)
+        return distance
 
-    # ------------------------------------------------------------------
-    # Bedrock LLM adapter for openai.* model IDs
-    # ------------------------------------------------------------------
-    class BedrockOpenAILLM(AWSBedrockLLM):
-        def _build_openai_messages(self, messages):
-            result = []
-            for msg in messages:
-                role = msg.get("role", "user")
-                if role == "developer":
-                    role = "system"
-                content = msg.get("content", "")
-                if not isinstance(content, str):
-                    content = str(content)
-                result.append({"role": role, "content": content})
-            return result
-
-        def _parse_openai_response(self, response):
-            body = response.get("body").read().decode("utf-8")
-            data = json.loads(body)
-            choices = data.get("choices", [])
-            if not choices:
-                return str(data)
-            message = choices[0].get("message", {})
-            content = message.get("content", "")
-            if isinstance(content, list):
-                return "".join(
-                    p.get("text", "") if isinstance(p, dict) else str(p) for p in content
-                )
-            return content
-
-        def _extract_json_response(self, text: str) -> str:
-            text = re.sub(r"<reasoning>.*?</reasoning>", "", text, flags=re.DOTALL).strip()
-            decoder = json.JSONDecoder()
-            decoded = []
-            for i, ch in enumerate(text):
-                if ch not in "[{":
-                    continue
+    def _parse_output(self, vectors):
+        results = []
+        for v in vectors:
+            payload = v.get("metadata", {})
+            if isinstance(payload, str):
                 try:
-                    val, _ = decoder.raw_decode(text[i:])
-                    decoded.append(val)
+                    payload = json.loads(payload)
                 except json.JSONDecodeError:
-                    continue
-            if not decoded:
-                return text
-            for val in reversed(decoded):
-                if isinstance(val, dict) and isinstance(val.get("memory"), list):
-                    return json.dumps(val)
-            val = decoded[-1]
-            if isinstance(val, list):
-                return json.dumps({"memory": val})
-            if isinstance(val, dict):
-                for v in val.values():
-                    if isinstance(v, list):
-                        return json.dumps({"memory": v})
-            return json.dumps(val)
-
-        def generate_response(self, messages, response_format=None, tools=None,
-                              tool_choice="auto", stream=False, **kwargs):
-            request_body = {
-                "model": self.config.model,
-                "messages": self._build_openai_messages(messages),
-                "max_completion_tokens": self.config.max_tokens,
-                "temperature": self.config.temperature,
-                "stream": False,
-            }
-            if self.config.top_p is not None:
-                request_body["top_p"] = self.config.top_p
-            if response_format:
-                request_body["response_format"] = response_format
-            if getattr(self.config, "model_kwargs", None):
-                request_body.update(self.config.model_kwargs)
-            response = self.client.invoke_model(
-                body=json.dumps(request_body),
-                modelId=self.config.model,
-                accept="application/json",
-                contentType="application/json",
+                    payload = {}
+            results.append(
+                OutputData(
+                    id=v.get("key"),
+                    score=self._distance_to_similarity(v.get("distance")),
+                    payload=payload,
+                )
             )
-            parsed = self._parse_openai_response(response)
-            if response_format:
-                return self._extract_json_response(parsed)
-            return parsed
+        return results
 
-    # ------------------------------------------------------------------
-    # Register providers using dotted string paths that factory can resolve.
-    # "__main__" is the module name when Modal runs modal_server.py directly.
-    # ------------------------------------------------------------------
-    module = __name__  # "modal_server" locally, "__main__" on Modal
-    VectorStoreFactory.provider_to_class["s3_vectors"] = f"{module}.S3VectorsSimilarity"
-    LlmFactory.provider_to_class["aws_bedrock"] = (f"{module}.BedrockOpenAILLM", AWSBedrockConfig)
 
-    # Inject the classes into this module's namespace so the dotted path resolves
-    import sys
-    current_module = sys.modules[module]
-    current_module.S3VectorsSimilarity = S3VectorsSimilarity
-    current_module.BedrockOpenAILLM = BedrockOpenAILLM
+class BedrockOpenAILLM(AWSBedrockLLM):
+    """Bedrock LLM adapter for openai.* cross-region inference model IDs."""
 
-    return S3VectorsSimilarity, BedrockOpenAILLM, AWSBedrockConfig
+    def _build_openai_messages(self, messages):
+        result = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            if role == "developer":
+                role = "system"
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                content = str(content)
+            result.append({"role": role, "content": content})
+        return result
+
+    def _parse_openai_response(self, response):
+        body = response.get("body").read().decode("utf-8")
+        data = json.loads(body)
+        choices = data.get("choices", [])
+        if not choices:
+            return str(data)
+        message = choices[0].get("message", {})
+        content = message.get("content", "")
+        if isinstance(content, list):
+            return "".join(
+                p.get("text", "") if isinstance(p, dict) else str(p) for p in content
+            )
+        return content
+
+    def _extract_json_response(self, text: str) -> str:
+        text = re.sub(r"<reasoning>.*?</reasoning>", "", text, flags=re.DOTALL).strip()
+        decoder = json.JSONDecoder()
+        decoded = []
+        for i, ch in enumerate(text):
+            if ch not in "[{":
+                continue
+            try:
+                val, _ = decoder.raw_decode(text[i:])
+                decoded.append(val)
+            except json.JSONDecodeError:
+                continue
+        if not decoded:
+            return text
+        for val in reversed(decoded):
+            if isinstance(val, dict) and isinstance(val.get("memory"), list):
+                return json.dumps(val)
+        val = decoded[-1]
+        if isinstance(val, list):
+            return json.dumps({"memory": val})
+        if isinstance(val, dict):
+            for v in val.values():
+                if isinstance(v, list):
+                    return json.dumps({"memory": v})
+        return json.dumps(val)
+
+    def generate_response(self, messages, response_format=None, tools=None,
+                          tool_choice="auto", stream=False, **kwargs):
+        request_body = {
+            "model": self.config.model,
+            "messages": self._build_openai_messages(messages),
+            "max_completion_tokens": self.config.max_tokens,
+            "temperature": self.config.temperature,
+            "stream": False,
+        }
+        if self.config.top_p is not None:
+            request_body["top_p"] = self.config.top_p
+        if response_format:
+            request_body["response_format"] = response_format
+        if getattr(self.config, "model_kwargs", None):
+            request_body.update(self.config.model_kwargs)
+        response = self.client.invoke_model(
+            body=json.dumps(request_body),
+            modelId=self.config.model,
+            accept="application/json",
+            contentType="application/json",
+        )
+        parsed = self._parse_openai_response(response)
+        if response_format:
+            return self._extract_json_response(parsed)
+        return parsed
+
+
+# Register providers once at import time using the module's actual dotted path.
+# The factory resolves "modal_server.S3VectorsSimilarity" via importlib, so the
+# classes must exist at module scope — not inside a nested function.
+# Always use the literal module filename — __name__ becomes "__main__" when Modal
+# executes the file directly, which breaks importlib resolution inside the container.
+_module_name = "modal_server"
+VectorStoreFactory.provider_to_class["s3_vectors"] = f"{_module_name}.S3VectorsSimilarity"
+LlmFactory.provider_to_class["aws_bedrock"] = (f"{_module_name}.BedrockOpenAILLM", AWSBedrockConfig)
 
 
 def _make_app():
     """Build and return the FastAPI/FastMCP ASGI app. Called inside the container."""
     import os
-    import re
-    import logging
     from contextlib import contextmanager
     from typing import Any
 
@@ -210,13 +198,8 @@ def _make_app():
 
     from mem0 import Memory as Mem0Memory
     from mem0.memory.main import _safe_deepcopy_config
-    from mem0.utils.factory import VectorStoreFactory
     from mem0.utils.scoring import ENTITY_BOOST_WEIGHT
-
-    logger = logging.getLogger(__name__)
-
-    # Register providers and get classes
-    S3VectorsSimilarity, BedrockOpenAILLM, AWSBedrockConfig = _register_providers()
+    # S3VectorsSimilarity, BedrockOpenAILLM, VectorStoreFactory already available at module scope
 
     # ------------------------------------------------------------------
     # Langfuse helpers
@@ -463,7 +446,7 @@ def _make_app():
 # ---------------------------------------------------------------------------
 @app.function(
     cpu=1,
-    memory=1024,
+    memory=512,
     timeout=300,
 )
 @modal.asgi_app()
