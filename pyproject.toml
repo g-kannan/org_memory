@@ -11,4 +11,5 @@ dependencies = [
     "ollama",
     "click>=8.4.1",
     "langfuse>=4.7.1",
+    "fastmcp>=2.0.0",
 ]

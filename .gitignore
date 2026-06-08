@@ -12,3 +12,4 @@ wheels/
 # Local secrets
 .env
 out.json
+.kiro/*
