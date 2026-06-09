@@ -57,6 +57,15 @@ MCP tools
         Store a single memory string under the resolved scope.  Returns the
         memory_id assigned by the backend and the Scope_Key used.
 
+    update_memory(memory_id, data, metadata=None) -> {"memory_id": ..., "message": ...}
+        Update an existing memory by ID while preserving its stored scope metadata.
+
+    delete_memory(memory_id) -> {"memory_id": ..., "message": ...}
+        Delete one memory by ID.
+
+    delete_all_memories(scope, team_id=None, project_id=None, user_id=None)
+        Delete all memories under the resolved scope.
+
     retrieve_memory(query, scope=None, team_id=None, project_id=None,
                     user_id=None, top_k=10) -> list[MemoryResult]
         Search memories by semantic similarity.  When scope is given the search
@@ -233,6 +242,7 @@ def _make_app():
     """Build and return the FastAPI/FastMCP ASGI app. Called inside the container."""
     import os
     from contextlib import contextmanager
+    from datetime import datetime, timezone
     from typing import Any
 
     from fastapi import FastAPI
@@ -577,12 +587,22 @@ def _make_app():
         id: str
         score: float | None = None
         memory: str
+        created_at: str | None = None
+        updated_at: str | None = None
         metadata: dict[str, Any] = Field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # MCP server
     # ------------------------------------------------------------------
-    mcp = FastMCP("lastmem MCP Message Store")
+    mcp = FastMCP(
+        "StrategyShifu",
+        instructions=(
+            "Use this server to store and retrieve scoped organizational memory, "
+            "including project decisions, architecture choices, events, team facts, "
+            "and org knowledge. Prefer retrieve_memory for questions asking what the "
+            "organization, team, or project remembers."
+        ),
+    )
 
     @mcp.tool()
     async def store_memory(
@@ -593,7 +613,15 @@ def _make_app():
         user_id: str | None = None,
         metadata: dict[str, Any] | str | None = None,
     ) -> dict:
-        """Store a single memory string at a specified scope.
+        """Store a scoped organization memory fact.
+
+        Use this when the user asks to remember, save, record, or persist
+        organizational knowledge such as project decisions, architecture choices,
+        recurring events, team conventions, requirements, incidents, or user notes.
+        Store project-specific decisions with scope='project', team-wide facts with
+        scope='team', org-wide facts with scope='org', and personal notes with
+        scope='user'. Add metadata such as {"type": "decision"} or {"type": "event"}
+        when the memory category is clear.
 
         Args:
             memory: The memory text to store. Must be a non-empty string.
@@ -633,6 +661,10 @@ def _make_app():
         except ValueError as exc:
             return {"error": str(exc)}
 
+        now_iso = datetime.now(timezone.utc).isoformat()
+        memory_metadata.setdefault("created_at", now_iso)
+        memory_metadata.setdefault("updated_at", now_iso)
+
         # Store to backend
         result = _memory.add(
             [{"role": "user", "content": memory}],
@@ -642,19 +674,44 @@ def _make_app():
 
         # Extract memory_id from the add result
         memory_id = None
+        events = []
         if isinstance(result, dict):
             # mem0 returns {"results": [{"id": ..., "event": "ADD", ...}, ...]}
             results_list = result.get("results", [])
             if results_list and isinstance(results_list, list):
                 memory_id = results_list[0].get("id")
+                events = [
+                    {
+                        "id": item.get("id"),
+                        "event": item.get("event"),
+                        "memory": item.get("memory"),
+                    }
+                    for item in results_list
+                    if isinstance(item, dict)
+                ]
             if memory_id is None:
                 memory_id = result.get("id") or result.get("memory_id")
         elif isinstance(result, list) and result:
             first = result[0]
             if isinstance(first, dict):
                 memory_id = first.get("id") or first.get("memory_id")
+                events = [
+                    {
+                        "id": item.get("id"),
+                        "event": item.get("event"),
+                        "memory": item.get("memory"),
+                    }
+                    for item in result
+                    if isinstance(item, dict)
+                ]
 
-        return {"memory_id": memory_id, "scope_key": scope_key}
+        return {
+            "memory_id": memory_id,
+            "scope_key": scope_key,
+            "created_at": memory_metadata.get("created_at"),
+            "updated_at": memory_metadata.get("updated_at"),
+            "events": events,
+        }
 
     @mcp.tool()
     async def retrieve_memory(
@@ -665,7 +722,15 @@ def _make_app():
         user_id: str | None = None,
         top_k: int = 10,
     ) -> list[MemoryResult] | dict:
-        """Search stored memories by semantic similarity with optional scope filtering.
+        """Retrieve scoped organization memories by semantic search.
+
+        Use this when the user asks what has been remembered, asks to find stored
+        decisions, events, architecture choices, team facts, project context, or
+        user notes. For prompts like "bring all decisions made in this project",
+        call this tool with query terms such as "decisions architecture choices
+        agreed approaches", scope='project', and a larger top_k. Include
+        created_at and updated_at in the answer when comparing duplicates or
+        conflicting memories.
 
         Args:
             query: Natural language search query. Must be a non-empty string.
@@ -707,20 +772,52 @@ def _make_app():
                 return {"error": str(exc)}
 
             # mem0 uses user_id as the partition filter; pass scope_key as user_id (req 4.7)
-            response = _memory.search(query, filters={"user_id": scope_key}, limit=top_k)
+            response = _memory.search(query, filters={"user_id": scope_key}, top_k=top_k)
+            responses = [response]
         else:
             # Unscoped search: search all entries for the org (req 4.3)
             # The header must be present so we can derive org_id for future prefix-based
-            # filtering. mem0 does not natively support prefix filtering, so we search
-            # across the entire index and return all results — the caller receives results
-            # from all scope levels without further server-side narrowing.
+            # filtering. mem0 requires an exact user_id/agent_id/run_id filter, so query
+            # each concrete scope available from the header and merge the results.
             if parsed_ctx is None:
                 return {"error": "X-Memory-Context header is required when scope is not specified"}
-            # org_id is available via parsed_ctx["org_id"] for future use
-            response = _memory.search(query, limit=top_k)
+            scope_keys = [f"org:{parsed_ctx['org_id']}"]
+            if parsed_ctx.get("team_id"):
+                scope_keys.append(f"team:{parsed_ctx['org_id']}:{parsed_ctx['team_id']}")
+            if parsed_ctx.get("team_id") and parsed_ctx.get("project_id"):
+                scope_keys.append(
+                    f"project:{parsed_ctx['org_id']}:{parsed_ctx['team_id']}:{parsed_ctx['project_id']}"
+                )
+            if user_id:
+                scope_keys.append(f"user:{user_id}")
+
+            responses = [
+                _memory.search(query, filters={"user_id": scope_key}, top_k=top_k)
+                for scope_key in scope_keys
+            ]
 
         # Normalise response shape (mem0 may return a dict or a list)
-        items = response.get("results", response) if isinstance(response, dict) else response
+        items = []
+        for response in responses:
+            response_items = response.get("results", response) if isinstance(response, dict) else response
+            if isinstance(response_items, list):
+                items.extend(response_items)
+
+        deduped_items = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("id")
+            if not item_id:
+                continue
+            existing = deduped_items.get(item_id)
+            if existing is None or (item.get("score") or 0) > (existing.get("score") or 0):
+                deduped_items[item_id] = item
+        items = sorted(
+            deduped_items.values(),
+            key=lambda item: item.get("score") or 0,
+            reverse=True,
+        )[:top_k]
 
         # Map to MemoryResult; pull scope_key from stored metadata (req 4.4)
         results = [
@@ -728,6 +825,8 @@ def _make_app():
                 id=r.get("id", ""),
                 score=r.get("score"),
                 memory=r.get("memory", ""),
+                created_at=r.get("created_at") or (r.get("metadata") or {}).get("created_at"),
+                updated_at=r.get("updated_at") or (r.get("metadata") or {}).get("updated_at"),
                 metadata={
                     **(r.get("metadata") or {}),
                     # surface scope_key at the top level of metadata for convenience
@@ -740,6 +839,135 @@ def _make_app():
 
         # Return empty list when no results without raising an error (req 4.5)
         return results
+
+    @mcp.tool()
+    async def update_memory(
+        memory_id: str,
+        data: str,
+        metadata: dict[str, Any] | str | None = None,
+    ) -> dict:
+        """Update an existing memory by ID.
+
+        Use this when the user asks to correct, revise, replace, or update an
+        already stored memory and provides the memory ID. The memory text is
+        replaced with data. Existing scope metadata is preserved so the memory
+        stays in the same org/team/project/user partition.
+
+        Args:
+            memory_id: ID of the memory to update.
+            data: New memory text. Must be a non-empty string.
+            metadata: Optional custom metadata to merge into the memory.
+        """
+        if not memory_id or not memory_id.strip():
+            return {"error": "memory_id must be a non-empty string"}
+        if not data or not data.strip():
+            return {"error": "data must be a non-empty string"}
+
+        try:
+            custom_metadata = normalize_metadata(metadata)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        try:
+            existing_memory = _memory.vector_store.get(vector_id=memory_id)
+            if existing_memory is None:
+                return {"error": f"Memory with id {memory_id} not found"}
+
+            existing_payload = existing_memory.payload or {}
+            update_metadata = {**existing_payload, **custom_metadata}
+            for protected_key in (
+                "user_id",
+                "agent_id",
+                "run_id",
+                "scope",
+                "scope_key",
+                "created_at",
+            ):
+                if protected_key in existing_payload:
+                    update_metadata[protected_key] = existing_payload[protected_key]
+
+            result = _memory.update(
+                memory_id=memory_id,
+                data=data,
+                metadata=update_metadata,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        response = result if isinstance(result, dict) else {"result": result}
+        return {
+            "memory_id": memory_id,
+            **response,
+        }
+
+    @mcp.tool()
+    async def delete_memory(memory_id: str) -> dict:
+        """Delete a single memory by ID.
+
+        Use this when the user asks to forget or delete a specific remembered
+        item and provides its memory ID.
+
+        Args:
+            memory_id: ID of the memory to delete.
+        """
+        if not memory_id or not memory_id.strip():
+            return {"error": "memory_id must be a non-empty string"}
+
+        try:
+            result = _memory.delete(memory_id=memory_id)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        response = result if isinstance(result, dict) else {"result": result}
+        return {
+            "memory_id": memory_id,
+            **response,
+        }
+
+    @mcp.tool()
+    async def delete_all_memories(
+        scope: str,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        user_id: str | None = None,
+    ) -> dict:
+        """Delete all memories under a resolved scope.
+
+        Use this only when the user explicitly asks to delete or forget all
+        memories for an org, team, project, or user scope. This maps the scope
+        to the same internal scope_key used by store_memory and deletes every
+        memory in that partition.
+
+        Args:
+            scope: The scope level - one of 'org', 'team', 'project', or 'user'.
+            team_id: Override the team_id from the Identity Header (only used when scope='team' or 'project').
+            project_id: Override the project_id from the Identity Header (only used when scope='project').
+            user_id: Required when scope='user'; ignored for all other scopes.
+        """
+        try:
+            request = get_http_request()
+            header_value = request.headers.get("x-memory-context") or request.headers.get("X-Memory-Context")
+            parsed_ctx = parse_memory_context(header_value)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        if parsed_ctx is not None:
+            if team_id is not None:
+                parsed_ctx = {**parsed_ctx, "team_id": team_id}
+            if project_id is not None:
+                parsed_ctx = {**parsed_ctx, "project_id": project_id}
+
+        try:
+            scope_key = resolve_scope_key(scope, parsed_ctx, user_id=user_id)
+            result = _memory.delete_all(user_id=scope_key)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        response = result if isinstance(result, dict) else {"result": result}
+        return {
+            "scope_key": scope_key,
+            **response,
+        }
 
     # ------------------------------------------------------------------
     # FastAPI + streamable-HTTP MCP transport (stateless)

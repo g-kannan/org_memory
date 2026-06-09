@@ -8,6 +8,9 @@ Org-scoped memory server built with [FastMCP](https://github.com/jlowin/fastmcp)
 |------|-------------|
 | `store_memory` | Store a memory string at org / team / project / user scope |
 | `retrieve_memory` | Search memories by semantic similarity, with optional scope filter |
+| `update_memory` | Update an existing memory by ID |
+| `delete_memory` | Delete one memory by ID |
+| `delete_all_memories` | Delete every memory under a resolved scope |
 
 ---
 
@@ -77,17 +80,25 @@ Add to your MCP config (replace the URL with your Modal endpoint):
 
 ### Claude Desktop
 
+Claude Desktop commonly connects to remote streamable-HTTP MCP servers through
+`mcp-remote`. On Windows, invoke `npx.cmd` directly. Do not wrap it with
+`cmd.exe /C`, because paths such as `C:\Program Files\nodejs\npx.cmd` can be
+split incorrectly by `cmd.exe`.
+
 Add to `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "lastmem": {
-      "type": "streamable-http",
-      "url": "https://<your-workspace>--org-memory-mcp-web.modal.run/mcp/",
-      "headers": {
-        "X-Memory-Context": "org:<org_id>:team:<team_id>"
-      }
+      "command": "C:\\Program Files\\nodejs\\npx.cmd",
+      "args": [
+        "-y",
+        "mcp-remote@latest",
+        "https://<your-workspace>--org-memory-mcp-web.modal.run/mcp/",
+        "--header",
+        "X-Memory-Context: org:<org_id>:team:<team_id>"
+      ]
     }
   }
 }
@@ -225,6 +236,75 @@ When `scope` is omitted the search spans all entries accessible from the org in 
   "arguments": {
     "query": "deployment process",
     "top_k": 10
+  }
+}
+```
+
+---
+
+### `update_memory`
+
+Update one memory by ID.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `memory_id` | string | yes | Memory ID returned by `store_memory` or `retrieve_memory` |
+| `data` | string | yes | Replacement memory text. Must be non-empty. |
+| `metadata` | object | no | Extra metadata to merge into the memory |
+
+The server preserves existing scope metadata, so an update does not move the memory between org/team/project/user partitions.
+
+**Example tool call**:
+```json
+{
+  "tool": "update_memory",
+  "arguments": {
+    "memory_id": "mem_123",
+    "data": "Alex now prefers decaf coffee"
+  }
+}
+```
+
+---
+
+### `delete_memory`
+
+Delete one memory by ID.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `memory_id` | string | yes | Memory ID to delete |
+
+**Example tool call**:
+```json
+{
+  "tool": "delete_memory",
+  "arguments": {
+    "memory_id": "mem_123"
+  }
+}
+```
+
+---
+
+### `delete_all_memories`
+
+Delete all memories under the resolved scope.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `scope` | string | yes | One of `org`, `team`, `project`, `user` |
+| `team_id` | string | no | Overrides `team_id` from header (team/project scope) |
+| `project_id` | string | no | Overrides `project_id` from header (project scope) |
+| `user_id` | string | no* | Required only when `scope="user"` |
+
+**Example tool call**:
+```json
+{
+  "tool": "delete_all_memories",
+  "arguments": {
+    "scope": "user",
+    "user_id": "alice"
   }
 }
 ```

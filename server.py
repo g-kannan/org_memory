@@ -95,3 +95,67 @@ def retrieve_messages(query: str, user_id: str, top_k: int = 10) -> list[MemoryR
             span.update(output=[r.model_dump() for r in results])
         flush_langfuse()
         return results
+
+
+@mcp.tool()
+def update_message(memory_id: str, data: str, metadata: dict[str, Any] | None = None) -> Any:
+    """Update a stored memory by ID.
+
+    Args:
+        memory_id: ID of the memory to update.
+        data: New memory text.
+        metadata: Optional metadata to attach to the updated memory.
+    """
+    if not memory_id or not memory_id.strip():
+        raise ValueError("memory_id must be a non-empty string")
+    if not data or not data.strip():
+        raise ValueError("data must be a non-empty string")
+    with langfuse_observation(
+        name="mcp-update_message",
+        input={"memory_id": memory_id, "data": data, "metadata": metadata or {}},
+    ) as span:
+        result = _memory.update(memory_id=memory_id, data=data, metadata=metadata)
+        if span:
+            span.update(output=result)
+        flush_langfuse()
+        return result
+
+
+@mcp.tool()
+def delete_message(memory_id: str) -> Any:
+    """Delete a stored memory by ID.
+
+    Args:
+        memory_id: ID of the memory to delete.
+    """
+    if not memory_id or not memory_id.strip():
+        raise ValueError("memory_id must be a non-empty string")
+    with langfuse_observation(
+        name="mcp-delete_message",
+        input={"memory_id": memory_id},
+    ) as span:
+        result = _memory.delete(memory_id=memory_id)
+        if span:
+            span.update(output=result)
+        flush_langfuse()
+        return result
+
+
+@mcp.tool()
+def delete_all_messages(user_id: str) -> Any:
+    """Delete all memories for a user.
+
+    Args:
+        user_id: User ID whose memories should be deleted.
+    """
+    if not user_id or not user_id.strip():
+        raise ValueError("user_id must be a non-empty string")
+    with langfuse_observation(
+        name="mcp-delete_all_messages",
+        input={"user_id": user_id},
+    ) as span:
+        result = _memory.delete_all(user_id=user_id)
+        if span:
+            span.update(output=result)
+        flush_langfuse()
+        return result
